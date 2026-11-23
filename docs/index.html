@@ -8,7 +8,7 @@
 <section id="output" aria-live="polite" aria-busy="false"><div class="card blank"><div class="icon" aria-hidden="true">◇</div><div class="eyebrow">Адреса · транзакции · история</div><h2>От хеша — к проверенному платежу</h2><p>Вставьте хеш или переключитесь на проверку адресов. В EVM можно дополнительно валидировать точные реквизиты платежа.</p><div class="steps"><div><strong>Выполнение</strong>Receipt и включение в блок</div><div><strong>Реквизиты</strong>Реальное событие Transfer</div><div><strong>Сверка</strong>Совпадение двух RPC</div></div></div></section></div>
 <footer>Инструмент проверяет данные публичных RPC и заданные реквизиты. Он не подтверждает зачисление во внутреннем учёте биржи и не выполняет AML-проверку. Внутренние переводы нативной монеты через контракты и ERC-721/1155 не поддерживаются. История последних 20 проверок хранится в этом браузере; серверная база проверок не ведётся.</footer></main>
 <script type="module">
-import app from './worker/index.js';
+import app from './worker/index.js?v=97c4572c6b324959';
 const upstreamFetch=globalThis.fetch.bind(globalThis);
 globalThis.fetch=async(input,options)=>{const p=typeof input==='string'?input:'';if(p==='/api/check'||p==='/api/wallets')return app.fetch(new Request(new URL(p,location.origin),options));return upstreamFetch(input,options);};
 

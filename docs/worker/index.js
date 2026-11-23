@@ -1,5 +1,5 @@
 const TRANSFER='0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-import {NON_EVM,nonEvmCheck,nonEvmWallet} from './non-evm.js';
+import {NON_EVM,nonEvmCheck,nonEvmWallet} from './non-evm.js?v=97c4572c6b324959';
 export const NETWORKS={
  xlayer:{name:'X Layer',id:196,symbol:'OKB',rpc:['https://rpc.xlayer.tech','https://xlayerrpc.okx.com']},
  ethereum:{name:'Ethereum',id:1,symbol:'ETH',rpc:['https://ethereum-rpc.publicnode.com','https://eth.drpc.org']},
