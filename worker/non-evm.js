@@ -45,19 +45,431 @@ async function neTronWallet(address,contract,cursor){if(cursor&&!/^(scan:\d{1,7}
 export async function nonEvmWallet(input){const key=input.network,net=NON_EVM[key];if(!net)throw Error('Неподдерживаемая сеть');const specs=[['Источник',input.sourceAddress],['Получатель',input.destinationAddress]].filter(([,v])=>v?.trim());if(!specs.length)throw Error('Укажите хотя бы один адрес.');if(input.cursor&&specs.length!==1)throw Error('Для пагинации оставьте один адрес.');const reports=[];for(const[role,value]of specs){const address=await neAddress(key,value),contract=(input.walletContract||'').trim(),cursor=input.cursor||'';const r=key==='bitcoin'?await neBtcWallet(address,cursor):key==='ton'?await neTonWallet(address,contract,cursor):key==='solana'?await neSolWallet(address,contract,cursor):await neTronWallet(address,contract,cursor);reports.push({...r,role});}
  return{kind:'wallets',checkedAt:new Date().toISOString(),network:neNetwork(key),addressReports:reports,notes:[...neNotes,'История — страница индексатора/RPC, не полная история адреса. Для более ранних записей используйте курсор.','Символы токенов от индексатора не являются проверкой эмитента. Сверяйте полный адрес контракта / mint / Jetton master.',...(key==='solana'?['История Solana показывает ссылки на аккаунт. Она не охватывает автоматически отдельные SPL token accounts и не доказывает направление перевода.']:[]),...(key==='ton'?['В TON история показывает сообщения TON, а не завершение всей цепочки сообщений. Bounced/aborted требуют отдельной проверки. Jetton-баланс загружается отдельно; история Jetton здесь не декодируется.']:[]),...(key==='tron'?['Состояние TRON получено из TronGrid; для истории TRC-20 при отказе доступен резервный TronScan. Независимая сверка пока отсутствует. История TRX включает TransferContract; внутренние переводы контрактов в неё не входят.']:[])]};}
 
-export async function nonEvmCheck(input){
- const key=input.network,hash=(input.hash||'').trim().replace(/^0x/,''),report={kind:'externalTransaction',checkedAt:new Date().toISOString(),network:neNetwork(key),hash,status:'inconclusive',validation:{status:'incomplete',reasons:['Автоматическая сверка ожидаемого платежа в этой сети пока не выполняется. Сверьте реквизиты ниже вручную.']},rows:[],transfers:[],providers:[],notes:[...neNotes,'Суммы и адреса ниже — данные провайдера. Подписи, Merkle proofs и независимая финальность локально не проверяются.']};
- if(key==='solana'){
-  if(!/^[1-9A-HJ-NP-Za-km-z]{80,90}$/.test(hash)||neDecode58(hash).length!==64)throw Error('Нужна подпись транзакции Solana (Base58).');
-  report.providers=await Promise.all(neSolRpc.map(url=>neTry(url,async()=>{await neSolIdentity(url);return neRpc(url,'getTransaction',[hash,{encoding:'jsonParsed',commitment:'finalized',maxSupportedTransactionVersion:0}]);})));
-  const a=report.providers.find(p=>p.ok&&p.data)?.data;if(a){if(a.transaction.signatures[0]!==hash)throw Error('Подпись в ответе не совпала');report.status=a.meta.err?'reverted':'success';report.rows=[['Слот',a.slot],['Время',a.blockTime?new Date(a.blockTime*1000).toISOString():null],['Комиссия SOL',neUnits(a.meta.fee,9)],['Commitment','finalized']];const instructions=[...a.transaction.message.instructions,...(a.meta.innerInstructions||[]).flatMap(i=>i.instructions)];for(const i of instructions){if(i.program==='system'&&i.parsed?.type==='transfer'){const v=i.parsed.info;report.transfers.push({from:v.source,to:v.destination,amount:neUnits(v.lamports,9),symbol:'SOL'});}if(i.program==='spl-token'&&i.parsed?.type==='transferChecked'){const v=i.parsed.info;report.transfers.push({from:v.source,to:v.destination,amount:neUnits(v.tokenAmount.amount,v.tokenAmount.decimals),symbol:'SPL · '+v.mint});}}report.notes.push('SPL from/to обозначают token accounts, а не обязательно адреса владельцев. Непарсенные инструкции не показаны.');}
- }else if(key==='bitcoin'){
-  if(!neHex.test(hash))throw Error('Нужен Bitcoin txid: 64 hex-символа.');report.providers=await Promise.all(['https://mempool.space/api','https://blockstream.info/api'].map(base=>neTry(base,()=>neFetch(base+'/tx/'+hash))));const a=report.providers.find(p=>p.ok)?.data;if(a){if(a.txid!==hash.toLowerCase())throw Error('Txid в ответе не совпал');report.status=a.status.confirmed?'success':'pending';report.rows=[['Блок',a.status.block_height??'mempool'],['Хеш блока',a.status.block_hash],['Комиссия BTC',neUnits(a.fee,8)],['Входы',a.vin.map(v=>v.prevout?.scriptpubkey_address||'coinbase / script').join(', ')]];report.transfers=a.vout.map((v,i)=>({from:'Входы UTXO (не единый отправитель)',to:v.scriptpubkey_address||'script / OP_RETURN',amount:neUnits(v.value,8),symbol:'BTC · vout '+i}));report.notes.push('Выходы могут включать сдачу. Совпадение адреса входа не доказывает единого отправителя.');}
- }else if(key==='ton'){
-  let h=hash;if(!neHex.test(h)){try{const b=atob(h.replace(/-/g,'+').replace(/_/g,'/'));if(b.length!==32)throw Error();h=Array.from(b,c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join('');}catch{throw Error('Нужен хеш TON-транзакции: hex либо Base64.');}}report.hash=h.toLowerCase();
-  report.providers=[await neTry('https://tonapi.io',()=>neFetch('https://tonapi.io/v2/blockchain/transactions/'+h))];const a=report.providers[0].data;if(a){if(a.hash.toLowerCase()!==h.toLowerCase())throw Error('Хеш TON не совпал');report.status=a.aborted?'reverted':a.success?'success':'inconclusive';report.rows=[['Аккаунт транзакции',a.account?.address],['Блок',a.block],['LT',String(a.lt)],['Время',new Date(a.utime*1000).toISOString()],['Комиссия TON',neUnits(a.total_fees,9)]];for(const m of [...(a.in_msg?[a.in_msg]:[]),...(a.out_msgs||[])])if(m.msg_type==='int_msg')report.transfers.push({from:m.source?.address,to:m.destination?.address,amount:neUnits(m.value,9),symbol:'TON'+(m.bounced?' · bounced':'')});report.notes.push('Это одна транзакция аккаунта TON. Успех отправителя не гарантирует выполнение получателем; для Jetton нужна проверка цепочки сообщений/trace.');}
- }else if(key==='tron'){
-  if(!neHex.test(hash))throw Error('Нужен TRON txid: 64 hex-символа.');report.providers=[await neTry(neTronApi,async()=>{const[tx,info]=await Promise.all([neFetch(neTronApi+'/walletsolidity/gettransactionbyid',{value:hash}),neFetch(neTronApi+'/walletsolidity/gettransactioninfobyid',{value:hash})]);return{tx,info};})];const d=report.providers[0].data;if(d?.tx?.txID){if(d.tx.txID!==hash.toLowerCase())throw Error('TRON txid не совпал');const {tx,info}=d;report.status=tx.ret?.[0]?.contractRet==='SUCCESS'?'success':'reverted';report.rows=[['Блок (solidified)',info.blockNumber],['Комиссия TRX',neUnits(info.fee||0,6)],['Результат',tx.ret?.[0]?.contractRet]];for(const c of tx.raw_data?.contract||[])if(c.type==='TransferContract'){const v=c.parameter.value;report.transfers.push({from:await neTronBase58(v.owner_address),to:await neTronBase58(v.to_address),amount:neUnits(v.amount,6),symbol:'TRX'});}for(const l of info.log||[])if(l.topics?.[0]==='ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'&&l.topics.length===3&&neHex.test(l.data)){const contract=await neTronBase58('41'+l.address.slice(-40));report.transfers.push({from:await neTronBase58('41'+l.topics[1].slice(-40)),to:await neTronBase58('41'+l.topics[2].slice(-40)),amount:contract==='TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'?neUnits(BigInt('0x'+l.data),6):BigInt('0x'+l.data).toString(),symbol:contract==='TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'?'USDT':'минимальных единиц TRC-20',contract});}}
- }else throw Error('Неподдерживаемая сеть');
- report.notes.push('Эта проверка не выполняет автоматическую валидацию ожидаемой суммы/получателя.');return report;
+
+const TRON_USDT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+const TRON_TRANSFER = 'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const SOLANA_TOKEN_PROGRAMS = new Set([
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+]);
+const BITCOIN_SOURCES = ['https://mempool.space/api', 'https://blockstream.info/api'];
+const TON_API = 'https://tonapi.io';
+const TON_CENTER = 'https://toncenter.com';
+
+function paymentAmount(raw, decimals) {
+  const amount = neUnsigned(raw).toString();
+  return { rawAmount: amount, decimals, amount: decimals === null ? null : neUnits(amount, decimals) };
+}
+
+function paymentDecimals(value) {
+  return /^\d{1,2}$/.test(String(value)) && Number(value) <= 36 ? Number(value) : null;
+}
+
+function expectedUnits(amount, decimals) {
+  const [whole, fraction = ''] = amount.replace(',', '.').split('.');
+  if (fraction.slice(decimals).replace(/0/g, '')) return null;
+  return BigInt(whole + fraction.slice(0, decimals).padEnd(decimals, '0')).toString();
+}
+
+async function paymentAddress(key, address) {
+  if (key === 'bitcoin' && /^BC1[0-9A-Z]+$/.test(address)) address = address.toLowerCase();
+  if (key === 'tron' && /^(?:0x)?41[0-9a-f]{40}$/i.test(address)) address = await neTronBase58(address.replace(/^0x/i, ''));
+  return neAddress(key, address);
+}
+
+async function getExpectedPayment(input) {
+  const { network } = input;
+  const recipient = (input.recipient || '').trim();
+  const amount = (input.amount || '').trim();
+  const token = (input.contract || '').trim();
+  const asset = input.asset || (token ? 'token' : 'native');
+  if (!['native', 'token', 'erc20'].includes(asset)) throw Error('Выберите актив.');
+  if (network === 'bitcoin' && asset !== 'native') throw Error('Для Bitcoin поддерживается BTC.');
+  if (amount && (!/^\d{1,78}([.,]\d{1,36})?$/.test(amount) || !/[1-9]/.test(amount))) {
+    throw Error('Укажите положительную сумму без экспоненты.');
+  }
+  const minConfirmations = network === 'bitcoin' ? String(input.minConfirmations ?? '1').trim() : null;
+  if (minConfirmations !== null && (!/^\d{1,7}$/.test(minConfirmations) || Number(minConfirmations) < 1)) {
+    throw Error('Укажите от 1 до 9999999 подтверждений Bitcoin.');
+  }
+  return {
+    recipient: recipient ? await paymentAddress(network, recipient) : '',
+    amount,
+    asset: asset === 'native' ? 'native' : 'token',
+    contract: asset !== 'native' && token ? await paymentAddress(network, token) : '',
+    minConfirmations,
+  };
+}
+
+function validateExternalPayment(report) {
+  const { expected, transfers } = report;
+  if (!expected.recipient || !expected.amount || (expected.asset === 'token' && !expected.contract)) {
+    return { status: 'incomplete', reasons: ['Укажите получателя и сумму. Для токена также нужен адрес его контракта или mint.'] };
+  }
+  if (report.paymentBlocker) return { status: 'not_validated', reasons: [report.paymentBlocker] };
+
+  const assets = transfers.filter(transfer => expected.asset === 'native'
+    ? transfer.asset === 'native'
+    : transfer.asset === 'token' && transfer.contract === expected.contract);
+  const payee = assets.filter(transfer => transfer.to === expected.recipient
+    || (report.network.key === 'solana' && transfer.destinationTokenAccount === expected.recipient));
+  const matches = payee.filter(transfer => transfer.credited && transfer.decimals !== null
+    && expectedUnits(expected.amount, transfer.decimals) === transfer.rawAmount);
+  const failed = message => ({ status: 'not_validated', reasons: [message] });
+  if (!assets.length) return failed('Не найден перевод указанного актива.');
+  if (!payee.length) return failed('Не найден перевод этого актива на указанный адрес получателя.');
+  if (!payee.some(transfer => transfer.credited && transfer.decimals !== null)) {
+    return failed('Получение перевода или точность токена не подтверждены доступными данными.');
+  }
+  if (!matches.length) return failed('Точная сумма отдельного перевода или выхода не совпала.');
+  if (matches.length > 1) return failed('Найдено несколько одинаковых переводов или выходов. Нужна ручная сверка.');
+  return {
+    status: 'validated',
+    matchedTransferId: matches[0].id,
+    reasons: ['Актив, точная сумма и адрес получателя совпали с подтверждённым переводом.'],
+  };
+}
+
+function tonHash(value) {
+  if (typeof value !== 'string') return '';
+  if (neHex.test(value)) return value.toLowerCase();
+  if (!/^[a-z0-9+/_-]{43}=?$/i.test(value)) return '';
+  const raw = atob(value.replace(/-/g, '+').replace(/_/g, '/'));
+  return Array.from(raw, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+}
+
+async function tonActions(hash) {
+  const hashBase64 = btoa(String.fromCharCode(...hash.match(/../g).map(byte => parseInt(byte, 16))));
+  const query = new URLSearchParams({
+    tx_hash: hashBase64, include_transactions: 'true', limit: '50',
+  });
+  const response = await neFetch(TON_CENTER + '/api/v3/actions?' + query);
+  if (!Array.isArray(response.actions)) throw Error('Некорректный ответ TON Center.');
+  return response;
+}
+
+function tonInternalDelivery(action, from, to, rawAmount, jetton) {
+  return (action.transactions_full || []).filter(tx => {
+    const message = tx.in_msg;
+    if (!message || tx.description?.aborted !== false || message.bounced !== false) return false;
+    if (!action.transactions?.some(hash => tonHash(hash) === tonHash(tx.hash))) return false;
+    if (tx.account?.toLowerCase() !== to || message.source?.toLowerCase() !== from || message.destination?.toLowerCase() !== to) return false;
+    const decoded = message.message_content?.decoded;
+    return jetton
+      ? tx.description.compute_ph?.success === true && message.opcode?.toLowerCase() === '0x178d4519'
+        && String(decoded?.amount?.value) === rawAmount
+        && String(decoded?.query_id) === String(action.details.query_id)
+      : String(message.value) === rawAmount;
+  });
+}
+
+async function inspectTonPayment(report) {
+  const direct = neTry(TON_API, () => neFetch(TON_API + '/v2/blockchain/transactions/' + report.hash));
+  let [transaction, actions] = await Promise.all([direct, neTry(TON_CENTER, () => tonActions(report.hash))]);
+  let transactionHash = report.hash;
+  if (transaction.data && tonHash(transaction.data.hash) !== transactionHash) {
+    transaction = { endpoint: TON_API, ok: false, error: 'Хеш транзакции не совпал.' };
+  }
+  if (!transaction.ok && !actions.data?.actions.length && transaction.error?.startsWith('HTTP 404')) {
+    const byMessage = await neTry(TON_API, async () => {
+      const tx = await neFetch(TON_API + '/v2/blockchain/messages/' + report.hash + '/transaction');
+      if (!tonHash(tx.hash) || tonHash(tx.in_msg?.hash) !== report.hash) throw Error('Связь хеша сообщения с транзакцией не подтверждена.');
+      return tx;
+    });
+    if (byMessage.ok) {
+      transaction = byMessage;
+      transactionHash = tonHash(byMessage.data.hash);
+      actions = await neTry(TON_CENTER, () => tonActions(transactionHash));
+      report.rows.push(['Транзакция по хешу сообщения', transactionHash]);
+    }
+  }
+  report.providers = [transaction, actions];
+  if (transaction.ok) {
+    const tx = transaction.data;
+    report.status = tx.aborted ? 'reverted' : tx.success ? 'success' : 'inconclusive';
+    report.rows.push(['Аккаунт транзакции', tx.account?.address], ['Блок', tx.block], ['LT', String(tx.lt)],
+      ['Время', new Date(tx.utime * 1000).toISOString()], ['Комиссия TON', neUnits(tx.total_fees, 9)]);
+  }
+  if (!actions.ok || actions.data.actions.length >= 50) {
+    report.paymentBlocker = 'TON Center не вернул полный список действий. Повторите проверку.';
+  } else {
+    const seen = new Set();
+    const metadata = new Map();
+    const walletMetadata = new Map(Object.entries(actions.data.metadata || {}).map(([address, data]) => [address.toLowerCase(), data]));
+    for (const action of actions.data.actions) {
+      if (!action.transactions?.some(hash => tonHash(hash) === transactionHash)) continue;
+      if (!['ton_transfer', 'jetton_transfer'].includes(action.type)) continue;
+      if (!action.action_id || seen.has(action.action_id)) continue;
+      seen.add(action.action_id);
+      const details = action.details;
+      const jetton = action.type === 'jetton_transfer';
+      const from = tonAddress(jetton ? details.sender : details.source);
+      const to = tonAddress(jetton ? details.receiver : details.destination);
+      const contract = jetton ? tonAddress(details.asset) : null;
+      let decimals = jetton ? null : 9;
+      let symbol = jetton ? 'Jetton' : 'TON';
+      if (jetton && (!report.expected.contract || report.expected.contract === contract)) {
+        if (!metadata.has(contract)) {
+          const source = await neTry(TON_API, async () => {
+            const response = await neFetch(TON_API + '/v2/jettons/' + encodeURIComponent(contract));
+            const mint = response.metadata;
+            if (tonAddress(mint.address) !== contract) throw Error('Jetton master не совпал.');
+            return { contract, decimals: paymentDecimals(mint.decimals), symbol: mint.symbol };
+          });
+          metadata.set(contract, source.data);
+          report.providers.push({ ...source, lookup: 'Метаданные Jetton' });
+        }
+        const token = metadata.get(contract);
+        decimals = token?.decimals ?? null;
+        symbol = token?.symbol || symbol;
+      }
+      const amount = paymentAmount(jetton ? details.amount : details.value, decimals);
+      const receivingWallet = jetton ? tonAddress(details.receiver_jetton_wallet) : to;
+      const deliveries = tonInternalDelivery(action,
+        jetton ? tonAddress(details.sender_jetton_wallet) : from, receivingWallet, amount.rawAmount, jetton);
+      const ownerVerified = !jetton || walletMetadata.get(receivingWallet)?.token_info?.some(token =>
+        token.valid === true && token.type === 'jetton_wallets'
+        && token.extra?.owner?.toLowerCase() === to && token.extra?.jetton?.toLowerCase() === contract);
+      report.transfers.push({
+        id: action.action_id, from, to, asset: jetton ? 'token' : 'native', contract, symbol, ...amount,
+        credited: Boolean(action.success === true && action.finality === 'finalized'
+          && deliveries.length === 1 && ownerVerified && from !== to),
+        evidenceTransaction: deliveries.length === 1 ? tonHash(deliveries[0].hash) : null,
+      });
+    }
+    if (report.transfers.some(transfer => transfer.credited)) report.status = 'success';
+    if (!report.transfers.length) {
+      report.paymentBlocker = 'В TON Center пока нет связанного действия перевода. Проверьте хеш и повторите запрос после индексации.';
+    }
+  }
+  if (!report.transfers.length && transaction.ok) {
+    const tx = transaction.data;
+    const messages = [tx.in_msg, ...(tx.out_msgs || [])].filter(msg => msg?.msg_type === 'int_msg');
+    report.transfers = messages.map((msg, index) => ({
+      id: 'message:' + index, from: msg.source?.address, to: msg.destination?.address, ...paymentAmount(msg.value, 9),
+      symbol: msg.bounced ? 'TON · возврат' : 'TON · сообщение', credited: false,
+    }));
+  }
+  report.notes.push('Сверка TON опирается на финализированное действие TON Center и успешную транзакцию получателя. Для Jetton получатель сверяется по владельцу Jetton-кошелька.');
+}
+
+async function inspectTronPayment(report) {
+  const source = await neTry(neTronApi, async () => {
+    const [tx, info] = await Promise.all([
+      neFetch(neTronApi + '/walletsolidity/gettransactionbyid', { value: report.hash }),
+      neFetch(neTronApi + '/walletsolidity/gettransactioninfobyid', { value: report.hash }),
+    ]);
+    if (!tx.txID && !info.id) return null;
+    if (tx.txID?.toLowerCase() !== report.hash || info.id?.toLowerCase() !== report.hash || !/^[1-9]\d*$/.test(String(info.blockNumber))) {
+      throw Error('TronGrid не вернул согласованную транзакцию и квитанцию блока.');
+    }
+    return { tx, info };
+  });
+  report.providers = [source];
+  if (!source.data) {
+    report.status = source.ok ? 'not_found' : 'inconclusive';
+    report.paymentBlocker = 'TronGrid не подтвердил включение транзакции в solidified-блок.';
+    return;
+  }
+  const { tx, info } = source.data;
+  const result = tx.ret?.[0]?.contractRet;
+  const receiptResult = info.receipt?.result;
+  const executed = result === 'SUCCESS'
+    && (!info.result || info.result === 'SUCCESS')
+    && (!receiptResult || receiptResult === 'SUCCESS');
+  report.status = executed ? 'success' : 'reverted';
+  report.rows = [['Блок (solidified)', info.blockNumber], ['Комиссия TRX', neUnits(info.fee || 0, 6)], ['Результат', receiptResult || result]];
+  if (!executed) report.paymentBlocker = 'Транзакция TRON завершилась с ошибкой или отсутствует успешная квитанция.';
+  const transfers = [];
+  for (const [index, instruction] of (tx.raw_data?.contract || []).entries()) {
+    if (instruction.type !== 'TransferContract') continue;
+    const value = instruction.parameter.value;
+    transfers.push({
+      id: 'contract:' + index, asset: 'native', symbol: 'TRX', ...paymentAmount(value.amount, 6),
+      from: await neTronBase58(value.owner_address), to: await neTronBase58(value.to_address), credited: executed,
+    });
+  }
+  const metadata = new Map([[TRON_USDT, 6]]);
+  for (const [index, log] of (info.log || []).entries()) {
+    if (log.topics?.[0]?.toLowerCase() !== TRON_TRANSFER || log.topics.length !== 3 || !neHex.test(log.data)
+      || !log.topics.slice(1).every(topic => /^0{24}[0-9a-f]{40}$/i.test(topic)) || !/^[0-9a-f]{40}$/i.test(log.address)) continue;
+
+    const contract = await neTronBase58('41' + log.address);
+    const from = await neTronBase58('41' + log.topics[1].slice(-40));
+    const to = await neTronBase58('41' + log.topics[2].slice(-40));
+    if (!metadata.has(contract) && report.expected.contract === contract && executed) {
+      const source = await neTry(neTronApi, async () => {
+        const data = await neFetch(neTronApi + '/walletsolidity/triggerconstantcontract', {
+          owner_address: from, contract_address: contract, function_selector: 'decimals()', visible: true,
+        });
+        if (!data.result?.result || !neHex.test(data.constant_result?.[0])) throw Error('Не удалось прочитать decimals токена.');
+        return paymentDecimals(BigInt('0x' + data.constant_result[0]).toString());
+      });
+      metadata.set(contract, source.data ?? null);
+      report.providers.push({ ...source, lookup: 'Точность TRC-20' });
+    }
+    transfers.push({
+      id: 'log:' + index, from, to, asset: 'token', contract, symbol: contract === TRON_USDT ? 'USDT' : 'TRC-20',
+      ...paymentAmount(BigInt('0x' + log.data), metadata.get(contract) ?? null),
+      credited: executed && receiptResult === 'SUCCESS' && from !== to,
+    });
+  }
+  report.transfers = transfers;
+  report.notes.push('TRON проверяется через solidified RPC TronGrid. Для TRC-20 используется событие Transfer указанного контракта, а точность произвольного токена читается из его текущего solidified состояния.');
+}
+
+function solanaPayments(tx) {
+  const groups = [tx.transaction.message.instructions, ...(tx.meta.innerInstructions || []).map(group => group.instructions)];
+  const keys = tx.transaction.message.accountKeys || [];
+  const account = (balance, address) => (keys[balance.accountIndex]?.pubkey ?? keys[balance.accountIndex]) === address;
+  const post = tx.meta.postTokenBalances || [];
+  const pre = tx.meta.preTokenBalances || [];
+  const transfers = [];
+  for (const [groupIndex, instructions] of groups.entries()) {
+    for (const [index, instruction] of instructions.entries()) {
+      const { programId, parsed } = instruction;
+      const value = parsed?.info;
+      if (!value || !['transfer', 'transferWithSeed', 'transferChecked', 'transferCheckedWithFee'].includes(parsed.type)) continue;
+      const id = groupIndex + ':' + index;
+      if (programId === '11111111111111111111111111111111' && ['transfer', 'transferWithSeed'].includes(parsed.type)) {
+        transfers.push({ id, from: value.source, to: value.destination, asset: 'native', symbol: 'SOL',
+          ...paymentAmount(value.lamports, 9), credited: tx.meta.err === null && value.source !== value.destination });
+      }
+      if (!SOLANA_TOKEN_PROGRAMS.has(programId)) continue;
+      const receiving = post.find(balance => account(balance, value.destination));
+      const sending = pre.find(balance => account(balance, value.source)) || post.find(balance => account(balance, value.source));
+      const mint = value.mint || receiving?.mint || sending?.mint;
+      const decimals = paymentDecimals(value.tokenAmount?.decimals ?? receiving?.uiTokenAmount?.decimals);
+      const quantity = neUnsigned(value.tokenAmount?.amount ?? value.amount);
+      const feeRaw = value.feeAmount?.amount ?? value.feeAmount ?? 0;
+      const fee = neUnsigned(feeRaw);
+      const token2022 = programId !== 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+      const amount = quantity >= fee ? quantity - fee : 0n;
+      const before = pre.find(balance => account(balance, value.destination));
+      const credited = tx.meta.err === null && Boolean(receiving?.owner) && Boolean(mint) && mint === receiving?.mint
+        && (!before || before.mint === mint) && decimals !== null && decimals === receiving?.uiTokenAmount?.decimals
+        && value.source !== value.destination && receiving.owner !== sending?.owner && amount > 0n;
+      transfers.push({
+        id, asset: 'token', contract: mint, symbol: 'SPL', from: sending?.owner || value.source, to: receiving?.owner,
+        destinationTokenAccount: value.destination, sourceTokenAccount: value.source, ...paymentAmount(amount, decimals),
+        credited, token2022, balanceChange: receiving
+          ? (neUnsigned(receiving.uiTokenAmount.amount) - neUnsigned(before?.uiTokenAmount?.amount ?? 0)).toString() : null,
+      });
+    }
+  }
+  for (const transfer of transfers) {
+    if (!transfer.token2022) continue;
+    const incoming = transfers.filter(other => other.destinationTokenAccount === transfer.destinationTokenAccount);
+    transfer.credited = transfer.credited && incoming.length === 1 && transfer.balanceChange === transfer.rawAmount;
+  }
+  return transfers;
+}
+
+async function inspectSolanaPayment(report) {
+  report.providers = await Promise.all(neSolRpc.map(endpoint => neTry(endpoint, async () => {
+    await neSolIdentity(endpoint);
+    const tx = await neRpc(endpoint, 'getTransaction', [report.hash, {
+      encoding: 'jsonParsed', commitment: 'finalized', maxSupportedTransactionVersion: 1,
+    }]);
+    if (!tx) return null;
+    if (tx.transaction.signatures[0] !== report.hash || !tx.meta || !Object.hasOwn(tx.meta, 'err')) {
+      throw Error('Подпись не совпала или отсутствуют данные выполнения.');
+    }
+    return { slot: tx.slot, blockTime: tx.blockTime, fee: tx.meta.fee, error: tx.meta.err, transfers: solanaPayments(tx) };
+  })));
+  const [left, right] = report.providers.map(source => source.data);
+  const tx = left || right;
+  if (!tx) {
+    report.status = report.providers.every(source => source.ok) ? 'not_found' : 'inconclusive';
+    report.paymentBlocker = 'Не получена финализированная транзакция Solana.';
+  } else {
+    report.rows = [['Слот', tx.slot], ['Время', tx.blockTime ? new Date(tx.blockTime * 1000).toISOString() : null],
+      ['Комиссия SOL', neUnits(tx.fee, 9)], ['Commitment', 'finalized']];
+    report.transfers = tx.transfers;
+    const twoResponses = Boolean(left && right);
+    report.agreement = twoResponses && left.slot === right.slot && JSON.stringify(left.error) === JSON.stringify(right.error)
+      && JSON.stringify(left.transfers) === JSON.stringify(right.transfers);
+    const disagreement = twoResponses && !report.agreement;
+    report.status = disagreement ? 'inconclusive' : (tx.error === null ? 'success' : 'reverted');
+    report.rows.push(['Сверка источников', report.agreement ? 'Два RPC совпали' : disagreement ? 'RPC расходятся' : 'Данные одного RPC']);
+    report.paymentSourceCount = disagreement ? 0 : twoResponses ? 2 : 1;
+    if (disagreement) report.paymentBlocker = 'Два RPC Solana вернули разные данные финализированной транзакции.';
+    else if (tx.error !== null) report.paymentBlocker = 'Транзакция Solana завершилась с ошибкой.';
+  }
+  report.notes.push('SPL-токен сверяется по mint и владельцу token account получателя на момент транзакции. Для Token-2022 с комиссией требуется подтверждение суммы изменением баланса.');
+}
+
+async function inspectBitcoinPayment(report) {
+  report.providers = await Promise.all(BITCOIN_SOURCES.map(endpoint => neTry(endpoint, async () => {
+    const tx = await neFetch(endpoint + '/tx/' + report.hash);
+    if (tx.txid?.toLowerCase() !== report.hash || typeof tx.status?.confirmed !== 'boolean' || !Array.isArray(tx.vout)) {
+      throw Error('Txid не совпал или отсутствуют выходы.');
+    }
+    let confirmations = null;
+    if (tx.status.confirmed) {
+      if (!neHex.test(tx.status.block_hash) || !/^[1-9]\d*$/.test(String(tx.status.block_height))) throw Error('Некорректные данные блока.');
+      const height = neUnsigned(await neFetch(endpoint + '/blocks/tip/height'));
+      if (height < neUnsigned(tx.status.block_height)) throw Error('Источник отстаёт от блока транзакции.');
+      confirmations = (height - neUnsigned(tx.status.block_height) + 1n).toString();
+    }
+    return { tx, confirmations };
+  })));
+  const [left, right] = report.providers.map(source => source.data);
+  const data = left || right;
+  if (!data) {
+    report.paymentBlocker = 'Индексаторы Bitcoin не вернули транзакцию.';
+    return;
+  }
+  const { tx } = data;
+  const inputs = tx.vin.map(v => v.prevout?.scriptpubkey_address || 'coinbase / script');
+  const confirmations = [left, right].reduce((minimum, value) => {
+    if (minimum === null || value?.confirmations === null || value?.confirmations === undefined) return null;
+    return BigInt(value.confirmations) < BigInt(minimum) ? value.confirmations : minimum;
+  }, left?.confirmations ?? null);
+  const payout = item => JSON.stringify([item.tx.status.confirmed, item.tx.status.block_height, item.tx.status.block_hash,
+    item.tx.vout.map(v => [v.scriptpubkey, v.scriptpubkey_address, String(v.value)])]);
+  report.agreement = Boolean(left && right && payout(left) === payout(right));
+  report.rows = [['Блок', tx.status.block_height ?? 'mempool'], ['Хеш блока', tx.status.block_hash],
+    ['Подтверждения · минимум двух источников', confirmations], ['Комиссия BTC', neUnits(tx.fee, 8)], ['Входы', inputs.join(', ')]];
+  report.transfers = tx.vout.map((output, index) => ({
+    id: 'vout:' + index, from: 'Входы UTXO', to: output.scriptpubkey_address, asset: 'native', symbol: 'BTC',
+    ...paymentAmount(output.value, 8), credited: Boolean(tx.status.confirmed && output.scriptpubkey_address),
+  }));
+  report.status = report.agreement ? (tx.status.confirmed ? 'success' : 'pending') : 'inconclusive';
+  if (!report.agreement) report.paymentBlocker = 'Два индексатора Bitcoin не подтвердили одинаковые выходы и блок.';
+  else if (!tx.status.confirmed) report.paymentBlocker = 'Транзакция Bitcoin пока в mempool.';
+  else if (confirmations === null || BigInt(confirmations) < BigInt(report.expected.minConfirmations)) {
+    report.paymentBlocker = 'Недостаточно подтверждений Bitcoin для заданного порога.';
+  }
+  report.notes.push('Сумма Bitcoin сверяется по одному выходу (vout). Сдача и несколько одинаковых выходов требуют проверки назначения платежа.');
+}
+
+export async function nonEvmCheck(input) {
+  const network = input.network;
+  if (!Object.hasOwn(NON_EVM, network)) throw Error('Неподдерживаемая сеть.');
+  let hash = (input.hash || '').trim();
+  if (network !== 'solana') hash = hash.replace(/^0x/i, '');
+  if (network === 'ton') {
+    hash = tonHash(hash);
+    if (!hash) throw Error('Нужен хеш TON в hex или Base64.');
+  } else if (network === 'solana') {
+    if (!/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(hash) || neDecode58(hash).length !== 64) {
+      throw Error('Нужна подпись транзакции Solana в Base58.');
+    }
+  } else {
+    if (!neHex.test(hash)) throw Error('Нужен txid из 64 hex-символов.');
+    hash = hash.toLowerCase();
+  }
+  const report = {
+    kind: 'externalTransaction', checkedAt: new Date().toISOString(), network: neNetwork(network),
+    hash, expected: await getExpectedPayment(input), status: 'inconclusive', rows: [], transfers: [], providers: [],
+    notes: [...neNotes, 'Сверка опирается на данные указанных сетевых источников. Криптографические доказательства локально не проверяются.'],
+  };
+  const inspectors = { ton: inspectTonPayment, tron: inspectTronPayment, solana: inspectSolanaPayment, bitcoin: inspectBitcoinPayment };
+  await inspectors[network](report);
+  report.validation = validateExternalPayment(report);
+  if (report.validation.status === 'validated' && report.paymentSourceCount === 1) {
+    report.validation.reasons.push('Совпадение проверено по одному RPC Solana. Второй источник не предоставил транзакцию.');
+  }
+  return report;
 }
