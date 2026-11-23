@@ -138,6 +138,74 @@ function tonHash(value) {
   return Array.from(raw, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('');
 }
 
+function isSolanaSignature(value) {
+  return /^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(value) && neDecode58(value).length === 64;
+}
+
+export function externalLookupTargets(value) {
+  const hash = value.replace(/^0x/i, '');
+  const targets = [];
+  if (neHex.test(hash)) {
+    targets.push(['tron', hash.toLowerCase()], ['bitcoin', hash.toLowerCase()]);
+  }
+  const ton = tonHash(hash);
+  if (ton) targets.push(['ton', ton]);
+  if (isSolanaSignature(value)) targets.push(['solana', value]);
+  return targets;
+}
+
+async function lookupTonHash(hash) {
+  const direct = await neTry(TON_API, () => neFetch(TON_API + '/v2/blockchain/transactions/' + hash));
+  if (direct.ok) {
+    if (tonHash(direct.data.hash) !== hash) throw Error('Хеш транзакции TON не совпал.');
+    return hash;
+  }
+  if (!direct.error.startsWith('HTTP 404 ·')) throw Error(direct.error);
+
+  const message = await neTry(TON_API, () => neFetch(TON_API + '/v2/blockchain/messages/' + hash + '/transaction'));
+  if (!message.ok && message.error.startsWith('HTTP 404 ·')) return null;
+  if (!message.ok) throw Error(message.error);
+  const transaction = tonHash(message.data.hash);
+  if (!transaction || tonHash(message.data.in_msg?.hash) !== hash) throw Error('Хеш входящего сообщения TON не совпал.');
+  return transaction;
+}
+
+export async function lookupExternalTransaction(network, hash) {
+  const sources = {
+    ton: [TON_API],
+    tron: [neTronApi],
+    bitcoin: BITCOIN_SOURCES,
+    solana: neSolRpc,
+  };
+  return Promise.all(sources[network].map(async endpoint => {
+    const response = await neTry(endpoint, async () => {
+      if (network === 'ton') return lookupTonHash(hash);
+      if (network === 'tron') {
+        const tx = await neFetch(endpoint + '/wallet/gettransactionbyid', { value: hash });
+        if (tx.txID?.toLowerCase() === hash) return hash;
+        if (Object.keys(tx).length === 0) return null;
+        throw Error('TronGrid не вернул транзакцию с указанным хешем.');
+      }
+      if (network === 'bitcoin') {
+        const tx = await neTry(endpoint, () => neFetch(endpoint + '/tx/' + hash));
+        if (!tx.ok && tx.error.startsWith('HTTP 404 ·')) return null;
+        if (!tx.ok) throw Error(tx.error);
+        if (tx.data.txid?.toLowerCase() !== hash) throw Error('Txid Bitcoin не совпал.');
+        return hash;
+      }
+      await neSolIdentity(endpoint);
+      const statuses = await neRpc(endpoint, 'getSignatureStatuses', [[hash], { searchTransactionHistory: true }]);
+      if (!Array.isArray(statuses.value) || statuses.value.length !== 1) throw Error('Некорректный ответ RPC Solana.');
+      const signature = statuses.value[0];
+      if (signature === null) return null;
+      if (!signature || !Number.isSafeInteger(signature.slot)) throw Error('RPC Solana не вернул слот транзакции.');
+      return hash;
+    });
+    if (!response.ok) return { endpoint, state: 'unavailable', error: response.error };
+    return { endpoint, state: response.data ? 'found' : 'not_found', hash: response.data };
+  }));
+}
+
 async function tonActions(hash) {
   const hashBase64 = btoa(String.fromCharCode(...hash.match(/../g).map(byte => parseInt(byte, 16))));
   const query = new URLSearchParams({
@@ -453,7 +521,7 @@ export async function nonEvmCheck(input) {
     hash = tonHash(hash);
     if (!hash) throw Error('Нужен хеш TON в hex или Base64.');
   } else if (network === 'solana') {
-    if (!/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(hash) || neDecode58(hash).length !== 64) {
+    if (!isSolanaSignature(hash)) {
       throw Error('Нужна подпись транзакции Solana в Base58.');
     }
   } else {

@@ -1,5 +1,5 @@
 const TRANSFER='0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-import {NON_EVM,nonEvmCheck,nonEvmWallet} from './non-evm.js';
+import {NON_EVM,nonEvmCheck,nonEvmWallet,externalLookupTargets,lookupExternalTransaction} from './non-evm.js';
 export const NETWORKS={
  xlayer:{name:'X Layer',id:196,symbol:'OKB',rpc:['https://rpc.xlayer.tech','https://xlayerrpc.okx.com']},
  ethereum:{name:'Ethereum',id:1,symbol:'ETH',rpc:['https://ethereum-rpc.publicnode.com','https://eth.drpc.org']},
@@ -90,10 +90,49 @@ export async function checkWallets(input){
  });return report;
 }
 
+async function lookupEvmTransaction(network, hash) {
+  return Promise.all(network.rpc.map(async endpoint => {
+    try {
+      const chainId = await rpc(endpoint, 'eth_chainId');
+      if (BigInt(chainId) !== BigInt(network.id)) throw Error('RPC ответил из другой сети.');
+      const transaction = await rpc(endpoint, 'eth_getTransactionByHash', [hash]);
+      if (transaction === null) return { endpoint, state: 'not_found' };
+      if (lower(transaction?.hash) !== hash) throw Error('Хеш транзакции не совпал.');
+      return { endpoint, state: 'found', hash };
+    } catch (error) {
+      return { endpoint, state: 'unavailable', error: error.message.slice(0, 180) };
+    }
+  }));
+}
+
+export async function detectTransactionNetwork(value) {
+  const hash = (value || '').trim();
+  const evmHash = /^0x/i.test(hash) ? lower(hash) : '0x' + lower(hash);
+  const targets = HASH.test(evmHash)
+    ? Object.keys(NETWORKS).map(network => [network, evmHash])
+    : [];
+  targets.push(...externalLookupTargets(hash));
+  if (!targets.length) throw Error('Введите хеш транзакции в hex или Base64 либо подпись Solana в Base58.');
+
+  const checks = await Promise.all(targets.map(async ([network, hash]) => {
+    const evm = NETWORKS[network];
+    const sources = evm
+      ? await lookupEvmTransaction(evm, hash)
+      : await lookupExternalTransaction(network, hash);
+    const match = sources.find(source => source.state === 'found');
+    const unavailable = sources.filter(source => source.state === 'unavailable').length;
+    const state = match ? 'found'
+      : unavailable === sources.length ? 'unavailable'
+      : unavailable > 0 ? 'partial' : 'not_found';
+    return { network, name: (evm || NON_EVM[network]).name, state, hash: match?.hash || null, sources };
+  }));
+  return { kind: 'networkDetection', checks, matches: checks.filter(check => check.state === 'found') };
+}
+
 export default{async fetch(request){const url=new URL(request.url);if(['/api/check','/api/wallets'].includes(url.pathname)){
  if(request.method!=='POST')return json({error:'Требуется POST.'},405);if(!request.headers.get('content-type')?.includes('application/json'))return json({error:'Требуется application/json.'},415);
  const origin=request.headers.get('origin');if(origin&&origin!==url.origin)return json({error:'Запрос с другого сайта запрещён.'},403);
- try{const text=await request.text();if(text.length>4096)return json({error:'Слишком большой запрос.'},413);const input=JSON.parse(text);if(!input||typeof input!=='object'||Array.isArray(input)||Object.values(input).some(v=>typeof v!=='string'&&typeof v!=='number'))return json({error:'Некорректные параметры.'},400);for(const k of['network','hash','recipient','sender','contract','amount','asset','sourceAddress','destinationAddress','walletContract','endBlock','cursor'])if(input[k]!==undefined&&typeof input[k]!=='string')return json({error:'Некорректный тип параметра.'},400);return json(await (url.pathname==='/api/wallets'?checkWallets(input):NON_EVM[input.network]?nonEvmCheck(input):check(input)));}catch(e){return json({error:e.message.slice(0,220)},400);}}
+ try{const text=await request.text();if(text.length>4096)return json({error:'Слишком большой запрос.'},413);const input=JSON.parse(text);if(!input||typeof input!=='object'||Array.isArray(input)||Object.values(input).some(v=>typeof v!=='string'&&typeof v!=='number'))return json({error:'Некорректные параметры.'},400);for(const k of['network','hash','recipient','sender','contract','amount','asset','sourceAddress','destinationAddress','walletContract','endBlock','cursor'])if(input[k]!==undefined&&typeof input[k]!=='string')return json({error:'Некорректный тип параметра.'},400);if(url.pathname==='/api/wallets')return json(await checkWallets(input));if(input.network==='auto')return json(await detectTransactionNetwork(input.hash));return json(await (Object.hasOwn(NON_EVM,input.network)?nonEvmCheck(input):check(input)));}catch(e){return json({error:e.message.slice(0,220)},400);}}
  if(url.pathname==='/favicon.ico')return new Response(null,{status:204});if(url.pathname!=='/'||!['GET','HEAD'].includes(request.method))return new Response('Not found',{status:404});return new Response(request.method==='HEAD'?null:HTML,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer','content-security-policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'"}});
 }};
 
@@ -102,8 +141,8 @@ const HTML=String.raw`<!doctype html><html lang="ru"><head><meta charset="utf-8"
 .txlink{overflow-wrap:anywhere;word-break:break-all;max-width:100%}[hidden]{display:none!important}</style></head><body>
 <header><div class="top"><div class="brand"><span class="logo" aria-hidden="true">✓</span>chaincheck<span class="pill">10 сетей</span></div><small>Проверка через RPC<br>Без своей ноды</small></div></header>
 <main><div class="eyebrow">Рабочее место проверки платежей</div><h1>Проверьте перевод по данным сети.</h1><p class="intro">Проверяйте транзакции, балансы и историю адресов. EVM, TON, TRON, Solana и Bitcoin. Источник данных и доступная глубина проверки показаны в отчёте.</p>
-<div class="layout"><aside><form id="form" class="card formcard"><h2>Параметры проверки</h2><label for="mode">Что проверить</label><select id="mode"><option value="transaction">Транзакцию</option><option value="wallets">Источник и получателя</option></select><label for="network">Сеть</label><select id="network" name="network"><option value="xlayer">X Layer · 196</option><option value="ethereum">Ethereum · 1</option><option value="bsc">BNB Smart Chain · 56</option><option value="polygon">Polygon · 137</option><option value="arbitrum">Arbitrum One · 42161</option><option value="base">Base · 8453</option><option value="ton">TON</option><option value="tron">TRON · TRC-20</option><option value="solana">Solana</option><option value="bitcoin">Bitcoin</option></select><div id="txFields"><label for="hash">Хеш транзакции</label><input id="hash" class="hashinput" name="hash" placeholder="0x…" required autocomplete="off" spellcheck="false" maxlength="100"><button type="button" class="sample" id="sample">Подставить ваш перевод 107,32 USDT0</button>
-<details id="conditions"><summary>Сверить с ожидаемым платежом</summary><label for="asset">Актив</label><select id="asset" name="asset"><option value="erc20">Токен ERC-20</option><option value="native">Нативная монета</option></select><label for="recipient">Ожидаемый получатель</label><input id="recipient" name="recipient" placeholder="Адрес в выбранной сети" spellcheck="false" autocomplete="off" maxlength="110"><div id="paymentTokenField"><label for="contract" id="paymentTokenLabel">Ожидаемый контракт токена</label><input id="contract" name="contract" placeholder="Полный адрес токена" spellcheck="false" autocomplete="off" maxlength="110"><p class="hint">Используйте адрес актива из заявки.</p></div><div class="row"><div><label for="amount">Точная сумма</label><input id="amount" name="amount" placeholder="107,32" inputmode="decimal" maxlength="115"></div><div id="confirmationField"><label for="minConfirmations">Мин. подтверждений</label><input id="minConfirmations" name="minConfirmations" value="12" type="number" min="1" max="9999999" required></div></div><div id="paymentSenderField"><label for="sender">Ожидаемый отправитель · необязательно</label><input id="sender" name="sender" placeholder="0x…" spellcheck="false" autocomplete="off" maxlength="42"></div><p class="hint" id="paymentNetworkHint"></p></details></div><div id="walletFields" hidden><label for="sourceAddress">Адрес источника · необязательно</label><input id="sourceAddress" name="sourceAddress" placeholder="Адрес в выбранной сети" maxlength="110" autocomplete="off" spellcheck="false"><label for="destinationAddress">Адрес получателя · необязательно</label><input id="destinationAddress" name="destinationAddress" placeholder="Адрес в выбранной сети" maxlength="110" autocomplete="off" spellcheck="false"><label for="walletContract" id="walletContractLabel">Контракт токена · необязательно</label><input id="walletContract" name="walletContract" placeholder="Для баланса и истории токена" maxlength="110" autocomplete="off" spellcheck="false"><div id="blockField"><label for="endBlock">Состояние на блоке · необязательно</label><input id="endBlock" name="endBlock" placeholder="Последний доступный блок" inputmode="numeric" maxlength="12"><p class="hint">ERC-20 история: 100 блоков для X Layer, 1000 для остальных EVM.</p></div><div id="cursorField" hidden><label for="cursor">Курсор более ранней истории · необязательно</label><input id="cursor" name="cursor" placeholder="Из предыдущего отчёта" maxlength="1500"><p class="hint">Для пагинации оставьте только один адрес.</p></div><p class="hint" id="walletHint">Укажите хотя бы один адрес. Без контракта показываем нативный баланс. Баланс токена не является проверкой его эмитента.</p><button type="button" class="sample" id="walletSample">Подставить адреса вашего перевода USDT0</button></div><button id="submit" class="primary">Проверить транзакцию</button><p class="hint">Только чтение. Подключать кошелёк не требуется. Запрашиваемые хеши и адреса передаются RPC-провайдерам.</p><div id="error" class="error" role="alert"></div></form><div id="history" class="card" style="margin-top:20px"></div></aside>
+<div class="layout"><aside><form id="form" class="card formcard"><h2>Параметры проверки</h2><label for="mode">Что проверить</label><select id="mode"><option value="transaction">Транзакцию</option><option value="wallets">Источник и получателя</option></select><label for="network">Сеть</label><select id="network" name="network"><option value="auto">Определить по хешу</option><option value="xlayer">X Layer · 196</option><option value="ethereum">Ethereum · 1</option><option value="bsc">BNB Smart Chain · 56</option><option value="polygon">Polygon · 137</option><option value="arbitrum">Arbitrum One · 42161</option><option value="base">Base · 8453</option><option value="ton">TON</option><option value="tron">TRON · TRC-20</option><option value="solana">Solana</option><option value="bitcoin">Bitcoin</option></select><div id="txFields"><label for="hash">Хеш транзакции</label><input id="hash" class="hashinput" name="hash" placeholder="Хеш или подпись Solana" required autocomplete="off" spellcheck="false" maxlength="100"><p class="hint" id="autoNetworkHint">Поиск проверит сети, в которых возможен хеш такого формата.</p><button type="button" class="sample" id="sample">Подставить ваш перевод 107,32 USDT0</button>
+<details id="conditions" hidden><summary>Сверить с ожидаемым платежом</summary><label for="asset">Актив</label><select id="asset" name="asset"><option value="erc20">Токен ERC-20</option><option value="native">Нативная монета</option></select><label for="recipient">Ожидаемый получатель</label><input id="recipient" name="recipient" placeholder="Адрес в выбранной сети" spellcheck="false" autocomplete="off" maxlength="110"><div id="paymentTokenField"><label for="contract" id="paymentTokenLabel">Ожидаемый контракт токена</label><input id="contract" name="contract" placeholder="Полный адрес токена" spellcheck="false" autocomplete="off" maxlength="110"><p class="hint">Используйте адрес актива из заявки.</p></div><div class="row"><div><label for="amount">Точная сумма</label><input id="amount" name="amount" placeholder="107,32" inputmode="decimal" maxlength="115"></div><div id="confirmationField"><label for="minConfirmations">Мин. подтверждений</label><input id="minConfirmations" name="minConfirmations" value="12" type="number" min="1" max="9999999" required></div></div><div id="paymentSenderField"><label for="sender">Ожидаемый отправитель · необязательно</label><input id="sender" name="sender" placeholder="0x…" spellcheck="false" autocomplete="off" maxlength="42"></div><p class="hint" id="paymentNetworkHint"></p></details></div><div id="walletFields" hidden><label for="sourceAddress">Адрес источника · необязательно</label><input id="sourceAddress" name="sourceAddress" placeholder="Адрес в выбранной сети" maxlength="110" autocomplete="off" spellcheck="false"><label for="destinationAddress">Адрес получателя · необязательно</label><input id="destinationAddress" name="destinationAddress" placeholder="Адрес в выбранной сети" maxlength="110" autocomplete="off" spellcheck="false"><label for="walletContract" id="walletContractLabel">Контракт токена · необязательно</label><input id="walletContract" name="walletContract" placeholder="Для баланса и истории токена" maxlength="110" autocomplete="off" spellcheck="false"><div id="blockField"><label for="endBlock">Состояние на блоке · необязательно</label><input id="endBlock" name="endBlock" placeholder="Последний доступный блок" inputmode="numeric" maxlength="12"><p class="hint">ERC-20 история: 100 блоков для X Layer, 1000 для остальных EVM.</p></div><div id="cursorField" hidden><label for="cursor">Курсор более ранней истории · необязательно</label><input id="cursor" name="cursor" placeholder="Из предыдущего отчёта" maxlength="1500"><p class="hint">Для пагинации оставьте только один адрес.</p></div><p class="hint" id="walletHint">Укажите хотя бы один адрес. Без контракта показываем нативный баланс. Баланс токена не является проверкой его эмитента.</p><button type="button" class="sample" id="walletSample">Подставить адреса вашего перевода USDT0</button></div><button id="submit" class="primary">Проверить транзакцию</button><p class="hint">Только чтение. Подключать кошелёк не требуется. Запрашиваемые хеши и адреса передаются RPC-провайдерам.</p><div id="error" class="error" role="alert"></div></form><div id="history" class="card" style="margin-top:20px"></div></aside>
 <section id="output" aria-live="polite" aria-busy="false"><div class="card blank"><div class="icon" aria-hidden="true">◇</div><div class="eyebrow">Адреса · транзакции · история</div><h2>От хеша — к проверенному платежу</h2><p>Вставьте хеш или переключитесь на проверку адресов. Чтобы сверить платёж, укажите актив, сумму и получателя.</p><div class="steps"><div><strong>Выполнение</strong>Статус и подтверждения</div><div><strong>Реквизиты</strong>Сумма, актив и адрес</div><div><strong>Сверка</strong>Источники и результат</div></div></div></section></div>
 <footer>Инструмент проверяет данные публичных RPC и заданные реквизиты. Он не подтверждает зачисление во внутреннем учёте биржи и не выполняет AML-проверку. Внутренние переводы нативной монеты через контракты и ERC-721/1155 не поддерживаются. История последних 20 проверок хранится в этом браузере; серверная база проверок не ведётся.</footer></main>
 <script>
@@ -133,8 +172,12 @@ const paymentNetworks={
   bitcoin:{coin:'BTC',hint:'Сверяем сумму одного выхода по двум источникам. Укажите нужный порог подтверждений.'},
 };
 let paymentNetwork;
+let lastManualNetwork = "xlayer";
 function syncPaymentFields(){
   const key=$('network').value, external=externalNetworks.includes(key), wallet=$('mode').value==='wallets';
+  $('conditions').hidden=key==='auto';
+  $('autoNetworkHint').hidden=key!=='auto';
+  if(key==='auto') return;
   const config=paymentNetworks[key], previous=paymentNetwork, switched=previous!==key, selected=$('asset').value;
   if(switched){
     $('asset').replaceChildren();
@@ -156,12 +199,17 @@ function syncPaymentFields(){
   $('paymentNetworkHint').textContent=config.hint||'Укажите нужный порог подтверждений для этой сети.';
 }
 function syncMode(){
-  const wallet=$('mode').value==='wallets', external=externalNetworks.includes($('network').value);
+  const wallet=$('mode').value==='wallets';
+  const network=$('network');
+  network.options[0].disabled=wallet;
+  if(wallet&&network.value==='auto') network.value=lastManualNetwork;
+  if(network.value!=='auto') lastManualNetwork=network.value;
+  const external=externalNetworks.includes(network.value);
   $('txFields').hidden=wallet;$('walletFields').hidden=!wallet;$('hash').required=!wallet;
   $('blockField').hidden=external;$('cursorField').hidden=!external;$('walletContract').disabled=$('network').value==='bitcoin';
   $('walletContractLabel').textContent=$('network').value==='ton'?'Jetton master · необязательно':$('network').value==='solana'?'SPL mint · необязательно':'Контракт токена · необязательно';
   $('walletHint').textContent=$('network').value==='ton'?'История — сообщения TON. Баланс Jetton доступен по адресу master.':$('network').value==='solana'?'История показывает ссылки на аккаунт. Для отдельного счёта токена укажите его адрес.':external?'Последние подтверждённые записи загружаются страницами. Укажите хотя бы один адрес.':'История доступна для выбранного ERC-20 за указанный диапазон блоков.';
-  $('submit').textContent=wallet?'Проверить адреса':'Проверить транзакцию';
+  $('submit').textContent=wallet?'Проверить адреса':network.value==='auto'?'Найти сеть':'Проверить транзакцию';
   syncPaymentFields();
 }
 $('mode').onchange=syncMode;
@@ -196,6 +244,82 @@ function renderExternal(r){
 syncMode();
 
 $('sample').onclick=()=>{$('network').value='xlayer';syncMode();$('hash').value='0xc2494159e490da9cb10917dd19cc4e1cc54000e89c7b4831ac107a56b42f6490';$('recipient').value='0xfa1cec922c4da19cca9e97172d5ff0eeb40e340f';$('contract').value='0x779ded0c9e1022225f8e0630b35a9b54be713736';$('amount').value='107.32';$('sender').value='';$('asset').value='erc20';$('contract').disabled=false;$('conditions').open=true;syncMode();};
-$('form').onsubmit=async e=>{e.preventDefault();$('error').textContent='';$('submit').disabled=true;$('submit').textContent='Загружаем данные сети…';$('output').setAttribute('aria-busy','true');try{const wallet=$('mode').value==='wallets',input=Object.fromEntries(new FormData(e.target));lastInput={...input};const res=await fetch(wallet?'/api/wallets':'/api/check',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(input),signal:AbortSignal.timeout(110000)}),data=await res.json();if(!res.ok)throw Error(data.error||'Ошибка сервера');render(data);if(!wallet&&/^(0x)?[0-9a-f]{64}$/.test(data.hash)&&!externalNetworks.includes(input.network)){try{localStorage.setItem('chaincheck-history',JSON.stringify([{hash:data.hash,network:data.network.key},...getHistory().filter(r=>r.hash!==data.hash||r.network!==data.network.key)].slice(0,20)));}catch{}history();}}catch(err){$('error').textContent='Не удалось выполнить проверку: '+err.message+' Предыдущий отчёт, если он показан, не обновлён.';}finally{$('submit').disabled=false;syncMode();$('output').setAttribute('aria-busy','false');}};
+function detectionCard(report, opened){
+  const {checks,matches}=report;
+  const incomplete=checks.filter(check=>check.state==='unavailable'||check.state==='partial');
+  const label=matches.length===1?'Сеть найдена · '+matches[0].name:matches.length>1?'Хеш найден в нескольких сетях':incomplete.length?'Поиск не дал подтверждённых совпадений':'Транзакция не найдена';
+  const message=matches.length>1?'Выберите нужную сеть.':!matches.length?'Проверьте хеш и повторите поиск при необходимости.':'';
+  const names={found:'Найдена',not_found:'Не найдена',partial:'Не найдена у ответившего источника',unavailable:'Источники недоступны'};
+  const warning=incomplete.length?'<p class="hint">Не все источники ответили: '+incomplete.map(check=>esc(check.name)).join(', ')+'.</p>':'';
+  const choices=opened?'':matches.map(match=>'<button type="button" class="secondary" data-detected-network="'+esc(match.network)+'">Открыть '+esc(match.name)+'</button>').join(' ');
+  const rows=checks.map(check=>kv(check.name,names[check.state])).join('');
+  return '<div class="card section"><h2>'+esc(label)+'</h2>'+(message?'<p>'+esc(message)+'</p>':'')+'<div class="actions">'+choices+'</div>'+warning+'<details><summary>Какие сети проверили</summary><dl>'+rows+'</dl></details></div>';
+}
+function chooseDetectedNetwork(match){
+  $('network').value=match.network;
+  $('hash').value=match.hash;
+  syncMode();
+}
+function showDetection(report){
+  current=null;
+  $('output').innerHTML=detectionCard(report,false);
+  $('output').querySelectorAll('[data-detected-network]').forEach(button=>{
+    button.onclick=()=>{
+      const match=report.matches.find(item=>item.network===button.dataset.detectedNetwork);
+      chooseDetectedNetwork(match);
+      $('form').requestSubmit();
+    };
+  });
+}
+async function submitCheck(path,input){
+  const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(input),signal:AbortSignal.timeout(110000)});
+  const report=await response.json();
+  if(!response.ok) throw Error(report.error||'Ошибка сервера');
+  return report;
+}
+$('form').onsubmit=async event=>{
+  event.preventDefault();
+  if($('submit').disabled) return;
+  const wallet=$('mode').value==='wallets', input=Object.fromEntries(new FormData(event.target));
+  let selected=input, detection=null;
+  lastInput={...input};
+  $('error').textContent='';
+  $('submit').disabled=true;
+  $('network').disabled=true;
+  $('mode').disabled=true;
+  $('submit').textContent=input.network==='auto'?'Ищем транзакцию в сетях…':'Загружаем данные сети…';
+  $('output').setAttribute('aria-busy','true');
+  try{
+    if(input.network==='auto'&&!wallet){
+      detection=await submitCheck('/api/check',{network:'auto',hash:input.hash});
+      if(detection.matches.length!==1){showDetection(detection);return;}
+      const match=detection.matches[0];
+      chooseDetectedNetwork(match);
+      selected={network:match.network,hash:match.hash};
+      lastInput=selected;
+      showDetection(detection);
+      $('submit').textContent='Загружаем транзакцию…';
+    }
+    const report=await submitCheck(wallet?'/api/wallets':'/api/check',selected);
+    render(report);
+    if(detection) $('output').insertAdjacentHTML('afterbegin',detectionCard(detection,true));
+    if(!wallet&&/^(0x)?[0-9a-f]{64}$/.test(report.hash)&&!externalNetworks.includes(selected.network)){
+      try{
+        const entry={hash:report.hash,network:report.network.key};
+        const recent=getHistory().filter(item=>item.hash!==entry.hash||item.network!==entry.network);
+        localStorage.setItem('chaincheck-history',JSON.stringify([entry,...recent].slice(0,20)));
+      }catch{}
+      history();
+    }
+  }catch(error){
+    $('error').textContent='Не удалось выполнить проверку: '+error.message;
+  }finally{
+    $('submit').disabled=false;
+    $('network').disabled=false;
+    $('mode').disabled=false;
+    syncMode();
+    $('output').setAttribute('aria-busy','false');
+  }
+};
 history();
 </script></body></html>`;

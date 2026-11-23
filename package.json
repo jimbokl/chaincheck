@@ -5,7 +5,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "validate": "node scripts/validate-artifact.mjs",
-    "test": "node scripts/test.mjs && node scripts/test-wallets.mjs && node scripts/test-external.mjs && node scripts/test-payments.mjs",
+    "test": "node scripts/test.mjs && node scripts/test-wallets.mjs && node scripts/test-external.mjs && node scripts/test-payments.mjs && node scripts/test-network-detection.mjs",
     "dev": "node scripts/preview.mjs",
     "build:pages": "node scripts/build-pages.mjs"
   }
