@@ -1,11 +1,12 @@
 {
-  "name": "sites-worker-esm-starter",
+  "name": "chaincheck",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
     "validate": "node scripts/validate-artifact.mjs",
-    "test": "node scripts/test.mjs",
-    "dev": "node scripts/preview.mjs"
+    "test": "node scripts/test.mjs && node scripts/test-wallets.mjs",
+    "dev": "node scripts/preview.mjs",
+    "build:pages": "node scripts/build-pages.mjs"
   }
 }
